@@ -1,0 +1,50 @@
+name: 更新日曆
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 18 * * 0" # 每週一 02:00（台北時間）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 下載並合併日曆
+        run: |
+          python3 build.py ancient-holidays.ics
+          mkdir -p _site
+          cp ancient-holidays.ics _site/
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+      # 定期提交，避免 GitHub 在公開倉庫 60 天沒有活動後停用排程
+      - name: 提交最新日曆
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ancient-holidays.ics
+          git diff --cached --quiet || git commit -m "自動更新日曆"
+          git push
