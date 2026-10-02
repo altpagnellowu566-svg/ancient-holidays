@@ -1,20 +1,25 @@
-"""合併埃及、伊拉克、印度的 Google 公開假日日曆，翻成繁體中文，輸出單一 .ics。
+"""從 Google 日曆公開假日資料產生可訂閱的繁體中文行事曆。
 
-用法：python build.py [輸出檔名]
+- ancient-holidays.ics：埃及、伊拉克、印度合併，節日名稱翻成繁體中文
+- taiwan-holidays.ics：台灣節慶假日
+
+用法：python build.py [輸出資料夾]
 """
 import datetime
 import hashlib
+import os
 import re
 import sys
 import urllib.request
 from collections import OrderedDict
 
-SOURCES = [
+ANCIENT_SOURCES = [
     ("埃及", "en.eg"),
     ("伊拉克", "en.iq"),
     ("印度", "en.indian"),
 ]
-URL = "https://calendar.google.com/calendar/ical/{}%23holiday%40group.v.calendar.google.com/public/basic.ics"
+TAIWAN_SOURCE = "zh-tw.taiwan"
+URL ="https://calendar.google.com/calendar/ical/{}%23holiday%40group.v.calendar.google.com/public/basic.ics"
 
 # 英文名稱 -> (繁中名稱, 說明)
 NAMES = {
@@ -128,7 +133,16 @@ NAMES = {
     "Mesadi": ("太陽曆新年", ""),
 }
 
-KINDS = {"Public holiday": "國定假日", "Observance": "節慶（不放假）"}
+# Google 台灣繁中資料的誤譯，例如 2027 年的「補假」被寫成「厂礼拜」
+TAIWAN_FIXES = {"厂礼拜": "補假"}
+
+# Google 說明欄第一行 -> 假日類型（英文來源與台灣的繁中來源）
+KINDS = {
+    "Public holiday": "國定假日",
+    "Observance": "節慶（不放假）",
+    "國定假日": "國定假日",
+    "假日節慶": "節慶（不放假）",
+}
 
 
 def translate(name):
@@ -182,30 +196,20 @@ def fold(line):
     return "\r\n ".join(out)
 
 
-def main(path):
-    merged = OrderedDict()
-    untranslated = set()
-    for country, cal_id in SOURCES:
-        with urllib.request.urlopen(URL.format(cal_id), timeout=60) as resp:
-            text = resp.read().decode("utf-8")
-        events = list(parse(text))
-        if not events:
-            raise SystemExit(f"{country} 的來源沒有任何活動，停止輸出")
-        for ev in events:
-            src = unescape(ev["SUMMARY"])
-            zh, note, tentative, ok = translate(src)
-            if not ok:
-                untranslated.add(src)
-            kind = KINDS.get(unescape(ev.get("DESCRIPTION", "")).split("\n")[0], "")
-            key = (ev["DTSTART"], ev["DTEND"], zh)
-            item = merged.setdefault(key, {"countries": OrderedDict(), "notes": [], "src": [], "tentative": False})
-            item["countries"].setdefault(country, kind)
-            if note and note not in item["notes"]:
-                item["notes"].append(note)
-            if src not in item["src"]:
-                item["src"].append(src)
-            item["tentative"] |= tentative
+def fetch(cal_id):
+    with urllib.request.urlopen(URL.format(cal_id), timeout=60) as resp:
+        events = list(parse(resp.read().decode("utf-8")))
+    if not events:
+        raise SystemExit(f"{cal_id} 的來源沒有任何活動，停止輸出")
+    return events
 
+
+def kind_of(ev):
+    return KINDS.get(unescape(ev.get("DESCRIPTION", "")).split("\n")[0], "")
+
+
+def write_calendar(path, name, caldesc, events):
+    """events 為 (開始, 結束, 標題, 說明, UID 依據) 的清單。"""
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
         "BEGIN:VCALENDAR",
@@ -213,20 +217,13 @@ def main(path):
         "PRODID:-//ancient-holidays//ZH-TW",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-WR-CALNAME:古文明國家節日",
-        "X-WR-CALDESC:" + escape("埃及、伊拉克、印度的國定假日與節慶（繁體中文）。資料來源：Google 日曆公開假日資料。"),
+        "X-WR-CALNAME:" + escape(name),
+        "X-WR-CALDESC:" + escape(caldesc),
         "REFRESH-INTERVAL;VALUE=DURATION:P1D",
         "X-PUBLISHED-TTL:P1D",
     ]
-    for (start, end, zh), item in sorted(merged.items()):
-        countries = "、".join(item["countries"])
-        title = f"{zh}（{countries}{'，暫定' if item['tentative'] else ''}）"
-        desc = [f"{c}：{k}" if k else c for c, k in item["countries"].items()]
-        desc += item["notes"]
-        if item["tentative"]:
-            desc.append("日期為暫定，可能變動")
-        desc.append("英文名稱：" + " / ".join(s.replace(" (tentative)", "") for s in item["src"]))
-        uid = hashlib.sha1(f"{start}|{zh}".encode("utf-8")).hexdigest()[:20]
+    for start, end, title, desc, uid_key in sorted(events):
+        uid = hashlib.sha1(uid_key.encode("utf-8")).hexdigest()[:20]
         lines += [
             "BEGIN:VEVENT",
             f"UID:{uid}@ancient-holidays",
@@ -234,17 +231,75 @@ def main(path):
             f"DTSTART;VALUE=DATE:{start}",
             f"DTEND;VALUE=DATE:{end}",
             "SUMMARY:" + escape(title),
-            "DESCRIPTION:" + escape("\n".join(desc)),
+            "DESCRIPTION:" + escape(desc),
             "TRANSP:TRANSPARENT",
             "END:VEVENT",
         ]
     lines.append("END:VCALENDAR")
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write("\r\n".join(fold(l) for l in lines) + "\r\n")
-    print(f"已輸出 {path}：{len(merged)} 個活動")
+    print(f"已輸出 {path}：{len(events)} 個活動")
+
+
+def build_ancient(path):
+    merged = OrderedDict()
+    untranslated = set()
+    for country, cal_id in ANCIENT_SOURCES:
+        for ev in fetch(cal_id):
+            src = unescape(ev["SUMMARY"])
+            zh, note, tentative, ok = translate(src)
+            if not ok:
+                untranslated.add(src)
+            key = (ev["DTSTART"], ev["DTEND"], zh)
+            item = merged.setdefault(key, {"countries": OrderedDict(), "notes": [], "src": [], "tentative": False})
+            item["countries"].setdefault(country, kind_of(ev))
+            if note and note not in item["notes"]:
+                item["notes"].append(note)
+            if src not in item["src"]:
+                item["src"].append(src)
+            item["tentative"] |= tentative
+
+    events = []
+    for (start, end, zh), item in merged.items():
+        countries = "、".join(item["countries"])
+        title = f"{zh}（{countries}{'，暫定' if item['tentative'] else ''}）"
+        desc = [f"{c}：{k}" if k else c for c, k in item["countries"].items()]
+        desc += item["notes"]
+        if item["tentative"]:
+            desc.append("日期為暫定，可能變動")
+        desc.append("英文名稱：" + " / ".join(s.replace(" (tentative)", "") for s in item["src"]))
+        events.append((start, end, title, "\n".join(desc), f"{start}|{zh}"))
+    write_calendar(
+        path,
+        "古文明國家節日",
+        "埃及、伊拉克、印度的國定假日與節慶（繁體中文）。資料來源：Google 日曆公開假日資料。",
+        events,
+    )
     if untranslated:
         print("尚未翻譯的名稱（保留英文）：" + " | ".join(sorted(untranslated)))
 
 
+def build_taiwan(path):
+    # 來源已是繁體中文，只修正誤譯，並把說明欄換成假日類型（去掉 Google 的設定提示）
+    events = []
+    for ev in fetch(TAIWAN_SOURCE):
+        title = unescape(ev["SUMMARY"])
+        for wrong, right in TAIWAN_FIXES.items():
+            title = title.replace(wrong, right)
+        desc = "補行上班日" if "補班" in title else kind_of(ev)
+        events.append((ev["DTSTART"], ev["DTEND"], title, desc, f"tw|{ev['DTSTART']}|{title}"))
+    write_calendar(
+        path,
+        "台灣節慶假日",
+        "台灣的國定假日與節慶。資料來源：Google 日曆公開假日資料。",
+        events,
+    )
+
+
+def main(out_dir):
+    build_ancient(os.path.join(out_dir, "ancient-holidays.ics"))
+    build_taiwan(os.path.join(out_dir, "taiwan-holidays.ics"))
+
+
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "ancient-holidays.ics")
+    main(sys.argv[1] if len(sys.argv) > 1 else ".")
